@@ -1,81 +1,123 @@
-"""Tile feedback collection and aggregation."""
+"""Tile feedback — ratings, reactions, comments, and reputation signals."""
 import time
 from dataclasses import dataclass, field
-from collections import defaultdict
+from typing import Optional
 from enum import Enum
+from collections import defaultdict
 
-class Sentiment(Enum):
-    POSITIVE = "positive"
-    NEGATIVE = "negative"
-    NEUTRAL = "neutral"
+class ReactionType(Enum):
+    UPVOTE = "upvote"
+    DOWNVOTE = "downvote"
+    SHRUG = "shrug"
+    FLAG = "flag"
+    BOOKMARK = "bookmark"
+
+class FeedbackType(Enum):
+    RATING = "rating"
+    REACTION = "reaction"
+    COMMENT = "comment"
+    CORRECTION = "correction"
 
 @dataclass
-class FeedbackEntry:
+class Feedback:
     tile_id: str
-    rating: int  # 1-5
-    comment: str = ""
-    sentiment: Sentiment = Sentiment.NEUTRAL
-    agent: str = ""
-    timestamp: float = field(default_factory=time.time)
-    tags: list[str] = field(default_factory=list)
+    agent: str
+    type: FeedbackType
+    value: str = ""  # rating 1-5, reaction name, comment text
+    created_at: float = field(default_factory=time.time)
 
 @dataclass
-class FeedbackAggregate:
+class TileFeedbackSummary:
     tile_id: str
-    avg_rating: float
-    count: int
-    sentiment_dist: dict = field(default_factory=dict)
-    top_tags: list[tuple[str, int]] = field(default_factory=list)
+    rating_avg: float = 0.0
+    rating_count: int = 0
+    upvotes: int = 0
+    downvotes: int = 0
+    flags: int = 0
+    bookmarks: int = 0
+    comment_count: int = 0
+    top_comments: list[dict] = field(default_factory=list)
 
 class TileFeedback:
     def __init__(self):
-        self._feedback: dict[str, list[FeedbackEntry]] = defaultdict(list)
-        self._all: list[FeedbackEntry] = []
+        self._feedback: list[Feedback] = []
+        self._agent_history: dict[str, list[Feedback]] = defaultdict(list)
 
-    def add(self, tile_id: str, rating: int, comment: str = "",
-            agent: str = "", tags: list[str] = None) -> FeedbackEntry:
+    def rate(self, tile_id: str, agent: str, rating: int) -> Feedback:
         if not 1 <= rating <= 5:
             raise ValueError("Rating must be 1-5")
-        sentiment = Sentiment.POSITIVE if rating >= 4 else Sentiment.NEGATIVE if rating <= 2 else Sentiment.NEUTRAL
-        entry = FeedbackEntry(tile_id=tile_id, rating=rating, comment=comment,
-                            sentiment=sentiment, agent=agent, tags=tags or [])
-        self._feedback[tile_id].append(entry)
-        self._all.append(entry)
-        return entry
+        fb = Feedback(tile_id=tile_id, agent=agent, type=FeedbackType.RATING, value=str(rating))
+        self._add(fb)
+        return fb
 
-    def aggregate(self, tile_id: str) -> FeedbackAggregate:
-        entries = self._feedback.get(tile_id, [])
-        if not entries:
-            return FeedbackAggregate(tile_id=tile_id, avg_rating=0, count=0)
-        avg = sum(e.rating for e in entries) / len(entries)
-        dist = defaultdict(int)
-        tag_counts = defaultdict(int)
-        for e in entries:
-            dist[e.sentiment.value] += 1
-            for t in e.tags:
-                tag_counts[t] += 1
-        top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        return FeedbackAggregate(tile_id=tile_id, avg_rating=round(avg, 2),
-                               count=len(entries), sentiment_dist=dict(dist),
-                               top_tags=top_tags)
+    def react(self, tile_id: str, agent: str, reaction: str) -> Feedback:
+        fb = Feedback(tile_id=tile_id, agent=agent, type=FeedbackType.REACTION, value=reaction.lower())
+        self._add(fb)
+        return fb
 
-    def top_rated(self, n: int = 10, min_reviews: int = 1) -> list[FeedbackAggregate]:
-        aggregates = []
-        for tid in self._feedback:
-            agg = self.aggregate(tid)
-            if agg.count >= min_reviews:
-                aggregates.append(agg)
-        aggregates.sort(key=lambda a: a.avg_rating, reverse=True)
-        return aggregates[:n]
+    def comment(self, tile_id: str, agent: str, text: str) -> Feedback:
+        fb = Feedback(tile_id=tile_id, agent=agent, type=FeedbackType.COMMENT, value=text)
+        self._add(fb)
+        return fb
 
-    def needs_attention(self, max_rating: float = 2.0, min_reviews: int = 2) -> list[FeedbackAggregate]:
-        return [a for a in self.top_rated(100, min_reviews) if a.avg_rating <= max_rating]
+    def correct(self, tile_id: str, agent: str, correction: str) -> Feedback:
+        fb = Feedback(tile_id=tile_id, agent=agent, type=FeedbackType.CORRECTION, value=correction)
+        self._add(fb)
+        return fb
 
-    def by_agent(self, agent: str) -> list[FeedbackEntry]:
-        return [e for e in self._all if e.agent == agent]
+    def _add(self, fb: Feedback):
+        self._feedback.append(fb)
+        self._agent_history[fb.agent].append(fb)
+        if len(self._feedback) > 10000:
+            self._feedback = self._feedback[-10000:]
+
+    def summary(self, tile_id: str) -> TileFeedbackSummary:
+        tile_fb = [f for f in self._feedback if f.tile_id == tile_id]
+        ratings = [int(f.value) for f in tile_fb if f.type == FeedbackType.RATING]
+        reactions = [f.value for f in tile_fb if f.type == FeedbackType.REACTION]
+        comments = [f for f in tile_fb if f.type == FeedbackType.COMMENT]
+        avg = sum(ratings) / len(ratings) if ratings else 0.0
+        top = sorted(comments, key=lambda c: c.created_at, reverse=True)[:5]
+        return TileFeedbackSummary(
+            tile_id=tile_id, rating_avg=round(avg, 2), rating_count=len(ratings),
+            upvotes=reactions.count("upvote"), downvotes=reactions.count("downvote"),
+            flags=reactions.count("flag"), bookmarks=reactions.count("bookmark"),
+            comment_count=len(comments),
+            top_comments=[{"agent": c.agent, "text": c.value[:200],
+                          "ago_s": round(time.time() - c.created_at)} for c in top])
+
+    def agent_feedback(self, agent: str, limit: int = 50) -> list[Feedback]:
+        return self._agent_history.get(agent, [])[-limit:]
+
+    def controversial(self, n: int = 10) -> list[TileFeedbackSummary]:
+        """Tiles with most polarized feedback."""
+        tile_ids = set(f.tile_id for f in self._feedback)
+        summaries = [(self.summary(tid), abs(self.summary(tid).upvotes - self.summary(tid).downvotes))
+                    for tid in tile_ids]
+        summaries.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in summaries[:n]]
+
+    def flagged(self, n: int = 10) -> list[TileFeedbackSummary]:
+        summaries = []
+        seen = set()
+        for f in self._feedback:
+            if f.tile_id not in seen and f.type == FeedbackType.REACTION and f.value == "flag":
+                seen.add(f.tile_id)
+                summaries.append(self.summary(f.tile_id))
+        return summaries[:n]
+
+    def top_rated(self, n: int = 10) -> list[TileFeedbackSummary]:
+        tile_ids = set(f.tile_id for f in self._feedback)
+        summaries = [self.summary(tid) for tid in tile_ids if self.summary(tid).rating_count > 0]
+        summaries.sort(key=lambda s: s.rating_avg, reverse=True)
+        return summaries[:n]
+
+    def corrections_for(self, tile_id: str) -> list[Feedback]:
+        return [f for f in self._feedback if f.tile_id == tile_id and f.type == FeedbackType.CORRECTION]
 
     @property
     def stats(self) -> dict:
-        return {"tiles_reviewed": len(self._feedback),
-                "total_reviews": len(self._all),
-                "avg_rating": round(sum(e.rating for e in self._all) / len(self._all), 2) if self._all else 0}
+        return {"total_feedback": len(self._feedback),
+                "unique_tiles": len(set(f.tile_id for f in self._feedback)),
+                "unique_agents": len(set(f.agent for f in self._feedback)),
+                "by_type": {t.value: sum(1 for f in self._feedback if f.type == t) for t in FeedbackType}}
